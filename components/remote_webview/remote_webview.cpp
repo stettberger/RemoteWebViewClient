@@ -1,6 +1,8 @@
 #include "remote_webview.h"
 #include "remote_webview_config.h"
 #include "esphome/core/log.h"
+#include "esphome/core/color.h"
+#include <cmath>
 
 #include "esp_idf_version.h"
 #include "esp_event.h"
@@ -74,9 +76,20 @@ void RemoteWebView::setup() {
   display_width_ = display_->get_width();
   display_height_ = display_->get_height();
 
+  const size_t fb_size = (size_t)display_width_ * (size_t)display_height_ * 2u;
+  frame_buffer_ = (uint8_t*) heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (frame_buffer_) {
+    memset(frame_buffer_, 0, fb_size);
+  }
+  saved_patch_buf_ = (uint8_t*) heap_caps_malloc(32 * 32 * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!saved_patch_buf_) {
+    saved_patch_buf_ = (uint8_t*) malloc(32 * 32 * 2);
+  }
+
   q_decode_ = xQueueCreate(cfg::decode_queue_depth, sizeof(WsMsg));
   ws_send_mtx_ = xSemaphoreCreateMutex();
   state_mtx_ = xSemaphoreCreateMutex();
+  display_mtx_ = xSemaphoreCreateMutex();
 
   start_decode_task_();
   start_ws_task_();
@@ -126,6 +139,13 @@ void RemoteWebView::setup() {
 }
 
 void RemoteWebView::loop() {
+  if (this->indicator_active_ && (millis() - this->indicator_draw_time_ > 300)) {
+    this->clear_touch_indicator_();
+  }
+  if (this->data_activity_active_ && (millis() - this->last_data_activity_ms_ > 150)) {
+    this->clear_data_activity_indicator_();
+  }
+
   if (this->frame_update_pending_.exchange(false, std::memory_order_acq_rel)) {
     this->trigger_on_frame_update();
   }
@@ -410,6 +430,7 @@ void RemoteWebView::process_frame_packet_(const uint8_t *data, size_t len)
     frame_stats_count_++;
     ESP_LOGD(TAG, "frame %lu: tiles %u (%u bytes) - %lu ms", frame_id_, frame_tiles_, frame_bytes_, time_ms);
 
+    this->draw_data_activity_indicator_();
     this->frame_update_pending_.store(true, std::memory_order_release);
   }
 }
@@ -475,10 +496,31 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const
       return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
     }
 
-    display_->draw_pixels_at(dst_x, dst_y, (int)hdr.width, (int)hdr.height, hw_decode_output_buf_,
-        esphome::display::COLOR_ORDER_RGB,
-        esphome::display::COLOR_BITNESS_565,
-        rgb565_big_endian_);
+    if (frame_buffer_) {
+      const int W = display_width_;
+      const int tw = (int)hdr.width;
+      const int th = (int)hdr.height;
+      for (int r = 0; r < th; r++) {
+        int py = dst_y + r;
+        if (py < 0 || py >= display_height_) continue;
+        uint8_t *dst = frame_buffer_ + (py * W + dst_x) * 2;
+        memcpy(dst, hw_decode_output_buf_ + r * tw * 2, tw * 2);
+      }
+      if (indicator_active_) {
+        if (dst_x < saved_x_ + saved_w_ && dst_x + tw > saved_x_ &&
+            dst_y < saved_y_ + saved_h_ && dst_y + th > saved_y_) {
+          indicator_active_ = false;
+        }
+      }
+    }
+
+    if (xSemaphoreTake(display_mtx_, pdMS_TO_TICKS(50)) == pdTRUE) {
+      display_->draw_pixels_at(dst_x, dst_y, (int)hdr.width, (int)hdr.height, hw_decode_output_buf_,
+          esphome::display::COLOR_ORDER_RGB,
+          esphome::display::COLOR_BITNESS_565,
+          rgb565_big_endian_);
+      xSemaphoreGive(display_mtx_);
+    }
 
     return true;
   }
@@ -518,13 +560,32 @@ int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
   if (y + h > display_height_) h = display_height_ - y;
   if (w <= 0 || h <= 0) return 1;
 
-  display_->draw_pixels_at(
-      x, y, w, h,
-      (const uint8_t *)p->pPixels,
-      esphome::display::COLOR_ORDER_RGB,
-      esphome::display::COLOR_BITNESS_565,
-      rgb565_big_endian_
-  );
+  if (frame_buffer_) {
+    const int W = display_width_;
+    for (int r = 0; r < h; r++) {
+      int py = y + r;
+      if (py < 0 || py >= display_height_) continue;
+      uint8_t *dst = frame_buffer_ + (py * W + x) * 2;
+      memcpy(dst, (const uint8_t *)p->pPixels + r * p->iWidth * 2, w * 2);
+    }
+    if (indicator_active_) {
+      if (x < saved_x_ + saved_w_ && x + w > saved_x_ &&
+          y < saved_y_ + saved_h_ && y + h > saved_y_) {
+        indicator_active_ = false;
+      }
+    }
+  }
+
+  if (xSemaphoreTake(display_mtx_, pdMS_TO_TICKS(50)) == pdTRUE) {
+    display_->draw_pixels_at(
+        x, y, w, h,
+        (const uint8_t *)p->pPixels,
+        esphome::display::COLOR_ORDER_RGB,
+        esphome::display::COLOR_BITNESS_565,
+        rgb565_big_endian_
+    );
+    xSemaphoreGive(display_mtx_);
+  }
 
   return 1;
 }
@@ -594,6 +655,190 @@ bool RemoteWebView::ws_send_keepalive_() {
   return r == (int)n;
 }
 
+void RemoteWebView::clear_touch_indicator_() {
+  if (!indicator_active_ || !display_ || !saved_patch_buf_) return;
+
+  if (xSemaphoreTake(display_mtx_, pdMS_TO_TICKS(50)) == pdTRUE) {
+    display_->draw_pixels_at(saved_x_, saved_y_, saved_w_, saved_h_, saved_patch_buf_,
+                             esphome::display::COLOR_ORDER_RGB,
+                             esphome::display::COLOR_BITNESS_565,
+                             rgb565_big_endian_);
+    xSemaphoreGive(display_mtx_);
+  }
+  indicator_active_ = false;
+}
+
+void RemoteWebView::draw_data_activity_indicator_() {
+  if (!show_activity_indicator_ || !display_ || display_width_ < 32 || display_height_ < 32) return;
+
+  const int px = display_width_ - 24;
+  const int py = display_height_ - 24;
+  const int w = 16;
+  const int h = 16;
+
+  if (!data_activity_active_) {
+    if (frame_buffer_) {
+      for (int r = 0; r < h; r++) {
+        const uint8_t *src = frame_buffer_ + ((py + r) * display_width_ + px) * 2;
+        memcpy(data_patch_buf_ + r * w * 2, src, w * 2);
+      }
+    }
+    data_activity_active_ = true;
+  }
+
+  uint16_t row_buf[16 * 16];
+  const uint16_t color_green = rgb565_big_endian_ ? 0x07E0 : 0xE007;
+
+  memcpy(row_buf, data_patch_buf_, sizeof(row_buf));
+
+  const int r_dot = 6;
+  for (int dy = -r_dot; dy <= r_dot; dy++) {
+    int buf_y = 7 + dy;
+    int dx = (int) std::sqrt((float)(r_dot * r_dot - dy * dy));
+    for (int i = -dx; i <= dx; i++) {
+      row_buf[buf_y * 16 + 7 + i] = color_green;
+    }
+  }
+
+  if (xSemaphoreTake(display_mtx_, pdMS_TO_TICKS(50)) == pdTRUE) {
+    display_->draw_pixels_at(px, py, w, h, (const uint8_t*)row_buf,
+                             esphome::display::COLOR_ORDER_RGB,
+                             esphome::display::COLOR_BITNESS_565,
+                             rgb565_big_endian_);
+    xSemaphoreGive(display_mtx_);
+  }
+
+  last_data_activity_ms_ = millis();
+}
+
+void RemoteWebView::clear_data_activity_indicator_() {
+  if (!data_activity_active_ || !display_) return;
+
+  const int px = display_width_ - 24;
+  const int py = display_height_ - 24;
+  const int w = 16;
+  const int h = 16;
+
+  if (frame_buffer_) {
+    if (xSemaphoreTake(display_mtx_, pdMS_TO_TICKS(50)) == pdTRUE) {
+      display_->draw_pixels_at(px, py, w, h, data_patch_buf_,
+                               esphome::display::COLOR_ORDER_RGB,
+                               esphome::display::COLOR_BITNESS_565,
+                               rgb565_big_endian_);
+      xSemaphoreGive(display_mtx_);
+    }
+  }
+  data_activity_active_ = false;
+}
+
+void RemoteWebView::draw_touch_indicator_(int x, int y) {
+  if (!show_touch_indicator_ || !display_) return;
+
+  if (indicator_active_) {
+    clear_touch_indicator_();
+  }
+
+  const int r = 14;
+  int px_start = x - r;
+  int py_start = y - r;
+  int px_end   = x + r + 1;
+  int py_end   = y + r + 1;
+
+  if (px_start < 0) px_start = 0;
+  if (py_start < 0) py_start = 0;
+  if (px_end > display_width_) px_end = display_width_;
+  if (py_end > display_height_) py_end = display_height_;
+
+  int w = px_end - px_start;
+  int h = py_end - py_start;
+
+  if (w <= 0 || h <= 0 || w > 32 || h > 32) return;
+
+  const size_t patch_size = (size_t)w * (size_t)h * 2u;
+
+  if (frame_buffer_ && saved_patch_buf_) {
+    for (int row = 0; row < h; row++) {
+      const uint8_t *src = frame_buffer_ + ((py_start + row) * display_width_ + px_start) * 2;
+      uint8_t *dst = saved_patch_buf_ + row * w * 2;
+      memcpy(dst, src, w * 2);
+    }
+    saved_x_ = px_start;
+    saved_y_ = py_start;
+    saved_w_ = w;
+    saved_h_ = h;
+    indicator_active_ = true;
+    indicator_draw_time_ = millis();
+  }
+
+  uint16_t comp_buf[32 * 32];
+  if (saved_patch_buf_) {
+    memcpy(comp_buf, saved_patch_buf_, patch_size);
+  } else {
+    memset(comp_buf, 0, patch_size);
+  }
+
+  const uint16_t color_cyan = rgb565_big_endian_ ? 0x07FF : 0xFF07;
+  const uint16_t color_white = 0xFFFF;
+
+  // 1. Outer Ring (Radius 12px, 2px thickness)
+  const int r_out = 12;
+  const int r_in  = 10;
+  for (int dy = -r_out; dy <= r_out; dy++) {
+    int py = y + dy;
+    if (py < py_start || py >= py_start + h) continue;
+    int buf_y = py - py_start;
+
+    int dx_out = (int) std::sqrt((float)(r_out * r_out - dy * dy));
+    int dx_in  = (std::abs(dy) <= r_in) ? (int) std::sqrt((float)(r_in * r_in - dy * dy)) : 0;
+
+    int px_l = x - dx_out;
+    int w_l  = dx_out - dx_in + 1;
+    for (int i = 0; i < w_l; i++) {
+      int cur_x = px_l + i;
+      if (cur_x >= px_start && cur_x < px_start + w) {
+        comp_buf[buf_y * w + (cur_x - px_start)] = color_white;
+      }
+    }
+
+    if (dx_in > 0) {
+      int px_r = x + dx_in;
+      int w_r  = dx_out - dx_in + 1;
+      for (int i = 0; i < w_r; i++) {
+        int cur_x = px_r + i;
+        if (cur_x >= px_start && cur_x < px_start + w) {
+          comp_buf[buf_y * w + (cur_x - px_start)] = color_white;
+        }
+      }
+    }
+  }
+
+  // 2. Inner Core Dot (Radius 4px)
+  const int r_core = 4;
+  for (int dy = -r_core; dy <= r_core; dy++) {
+    int py = y + dy;
+    if (py < py_start || py >= py_start + h) continue;
+    int buf_y = py - py_start;
+
+    int dx = (int) std::sqrt((float)(r_core * r_core - dy * dy));
+    int px_c = x - dx;
+    int w_c  = 2 * dx + 1;
+    for (int i = 0; i < w_c; i++) {
+      int cur_x = px_c + i;
+      if (cur_x >= px_start && cur_x < px_start + w) {
+        comp_buf[buf_y * w + (cur_x - px_start)] = color_cyan;
+      }
+    }
+  }
+
+  if (xSemaphoreTake(display_mtx_, pdMS_TO_TICKS(50)) == pdTRUE) {
+    display_->draw_pixels_at(px_start, py_start, w, h, (const uint8_t*)comp_buf,
+                             esphome::display::COLOR_ORDER_RGB,
+                             esphome::display::COLOR_BITNESS_565,
+                             rgb565_big_endian_);
+    xSemaphoreGive(display_mtx_);
+  }
+}
+
 void RemoteWebViewTouchListener::update(const touchscreen::TouchPoints_t &pts) {
   if (!parent_) return;
 
@@ -602,17 +847,20 @@ void RemoteWebViewTouchListener::update(const touchscreen::TouchPoints_t &pts) {
     switch (p.state) {
       case touchscreen::STATE_PRESSED:
         parent_->ws_send_touch_event_(proto::TouchType::Down, p.x, p.y, p.id);
+        parent_->draw_touch_indicator_(p.x, p.y);
         break;
       case touchscreen::STATE_UPDATED:
         if (!RemoteWebView::kCoalesceMoves || RemoteWebView::kMoveIntervalUs == 0 ||
             (now - parent_->last_move_us_) >= RemoteWebView::kMoveIntervalUs) {
           parent_->last_move_us_ = now;
           parent_->ws_send_touch_event_(proto::TouchType::Move, p.x, p.y, p.id);
+          parent_->draw_touch_indicator_(p.x, p.y);
         }
         break;
       case touchscreen::STATE_RELEASING:
       case touchscreen::STATE_RELEASED:
         parent_->ws_send_touch_event_(proto::TouchType::Up, p.x, p.y, p.id);
+        parent_->clear_touch_indicator_();
         break;
       default: break;
     }
@@ -623,12 +871,14 @@ void RemoteWebViewTouchListener::release() {
   if (!parent_) return;
   
   parent_->ws_send_touch_event_(proto::TouchType::Up, 0, 0, 0);
+  parent_->clear_touch_indicator_();
 }
 
 void RemoteWebViewTouchListener::touch(touchscreen::TouchPoint tp) {
   if (!parent_) return;
   
   parent_->ws_send_touch_event_(proto::TouchType::Down, tp.x, tp.y, tp.id);
+  parent_->draw_touch_indicator_(tp.x, tp.y);
 }
 
 void RemoteWebView::disable_touch(bool disable) {

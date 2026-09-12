@@ -48,6 +48,12 @@ class RemoteWebView : public Component {
   void set_max_bytes_per_msg(int v) { max_bytes_per_msg_ = v; }
   void set_big_endian(bool v) { rgb565_big_endian_ = v; }
   void set_rotation(int v) { rotation_ = v; }
+  void set_show_touch_indicator(bool v) { show_touch_indicator_ = v; }
+  void set_show_activity_indicator(bool v) { show_activity_indicator_ = v; }
+  void draw_touch_indicator_(int x, int y);
+  void clear_touch_indicator_();
+  void draw_data_activity_indicator_();
+  void clear_data_activity_indicator_();
   void disable_touch(bool disable);
   bool open_url(const std::string &s);
   std::string get_current_url() const;
@@ -99,6 +105,21 @@ class RemoteWebView : public Component {
   bool rgb565_big_endian_{true};
   int rotation_{0};
   bool touch_disabled_{false};
+  bool show_touch_indicator_{true};
+  bool show_activity_indicator_{true};
+
+  uint8_t *frame_buffer_{nullptr};
+  uint8_t *saved_patch_buf_{nullptr};
+  int saved_x_{0};
+  int saved_y_{0};
+  int saved_w_{0};
+  int saved_h_{0};
+  bool indicator_active_{false};
+  uint32_t indicator_draw_time_{0};
+
+  bool data_activity_active_{false};
+  uint32_t last_data_activity_ms_{0};
+  uint8_t data_patch_buf_[16 * 16 * 2]{0};
 
 #if REMOTE_WEBVIEW_HW_JPEG
   jpeg_decoder_handle_t hw_dec_{nullptr};
@@ -130,6 +151,7 @@ class RemoteWebView : public Component {
   std::atomic<bool> url_publish_pending_{false};
   std::string pending_url_{};
   SemaphoreHandle_t state_mtx_{nullptr};
+  SemaphoreHandle_t display_mtx_{nullptr};
 
   uint32_t last_trigger_ms_{0};
   text_sensor::TextSensor *url_sensor_{nullptr};

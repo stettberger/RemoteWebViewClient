@@ -19,6 +19,8 @@ CONF_MIN_FRAME_INTERVAL = "min_frame_interval"
 CONF_JPEG_QUALITY = "jpeg_quality"
 CONF_MAX_BYTES_PER_MSG = "max_bytes_per_msg"
 CONF_BIG_ENDIAN = "big_endian"
+CONF_SHOW_TOUCH_INDICATOR = "show_touch_indicator"
+CONF_SHOW_ACTIVITY_INDICATOR = "show_activity_indicator"
 
 CONF_ON_FRAME_UPDATE = "on_frame_update"
 CONF_CURRENT_URL_SENSOR = "current_url_sensor"
@@ -73,6 +75,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_JPEG_QUALITY): cv.int_,
         cv.Optional(CONF_MAX_BYTES_PER_MSG): cv.int_,
         cv.Optional(CONF_BIG_ENDIAN): cv.boolean,
+        cv.Optional(CONF_SHOW_TOUCH_INDICATOR): cv.boolean,
+        cv.Optional(CONF_SHOW_ACTIVITY_INDICATOR): cv.boolean,
         cv.Optional(CONF_ROTATION): validate_rotation,
         cv.Optional(CONF_ON_FRAME_UPDATE): automation.validate_automation(
             {
@@ -132,6 +136,10 @@ async def to_code(config):
         cg.add(var.set_max_bytes_per_msg(config[CONF_MAX_BYTES_PER_MSG]))
     if CONF_BIG_ENDIAN in config:
         cg.add(var.set_big_endian(config[CONF_BIG_ENDIAN]))
+    if CONF_SHOW_TOUCH_INDICATOR in config:
+        cg.add(var.set_show_touch_indicator(config[CONF_SHOW_TOUCH_INDICATOR]))
+    if CONF_SHOW_ACTIVITY_INDICATOR in config:
+        cg.add(var.set_show_activity_indicator(config[CONF_SHOW_ACTIVITY_INDICATOR]))
     if CONF_ROTATION in config:
         cg.add(var.set_rotation(config[CONF_ROTATION]))
 
