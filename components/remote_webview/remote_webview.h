@@ -3,6 +3,7 @@
 #include "esphome/components/display/display.h"
 #include "esphome/components/touchscreen/touchscreen.h"
 #include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/components/text/text.h"
 #include "esphome/core/helpers.h"
 #include "JPEGDEC.h"
 #include "protocol.h"
@@ -31,6 +32,18 @@
 namespace esphome {
 namespace remote_webview {
 
+class RemoteWebView;
+
+class RemoteWebViewUrlText : public text::Text, public Component {
+ public:
+  void set_parent(RemoteWebView *parent) { parent_ = parent; }
+
+ protected:
+  void control(const std::string &value) override;
+
+  RemoteWebView *parent_{nullptr};
+};
+
 class RemoteWebView : public Component {
  public:
   void set_display(display::Display *d) { display_ = d; }
@@ -58,6 +71,7 @@ class RemoteWebView : public Component {
   bool open_url(const std::string &s);
   std::string get_current_url() const;
   void set_url_sensor(text_sensor::TextSensor *s) { url_sensor_ = s; }
+  void set_url_text(RemoteWebViewUrlText *t) { url_text_ = t; }
   void add_on_frame_update_callback(std::function<void()> &&callback);
   void trigger_on_frame_update();
 
@@ -155,6 +169,7 @@ class RemoteWebView : public Component {
 
   uint32_t last_trigger_ms_{0};
   text_sensor::TextSensor *url_sensor_{nullptr};
+  RemoteWebViewUrlText *url_text_{nullptr};
 
   void start_ws_task_();
   void start_decode_task_();

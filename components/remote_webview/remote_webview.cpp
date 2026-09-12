@@ -36,13 +36,21 @@ void RemoteWebView::trigger_on_frame_update() {
   this->on_frame_update_callback_.call();
 }
 
+void RemoteWebViewUrlText::control(const std::string &value) {
+  if (this->parent_ != nullptr) {
+    this->parent_->open_url(value);
+  } else {
+    this->publish_state(value);
+  }
+}
+
 void RemoteWebView::process_current_url_packet_(const uint8_t *data, size_t len) {
   if (!data || len < sizeof(proto::CurrentURLHeader)) return;
   
   auto *hdr = reinterpret_cast<const proto::CurrentURLHeader *>(data);
   if (sizeof(proto::CurrentURLHeader) + hdr->url_len > len) return;
   
-  if (this->url_sensor_ == nullptr) return;
+  if (this->url_sensor_ == nullptr && this->url_text_ == nullptr) return;
 
   std::string url(reinterpret_cast<const char*>(data + sizeof(proto::CurrentURLHeader)), hdr->url_len);
   if (this->state_mtx_ && xSemaphoreTake(this->state_mtx_, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -56,7 +64,10 @@ std::string RemoteWebView::get_current_url() const {
   if (this->url_sensor_ != nullptr && this->url_sensor_->has_state()) {
     return this->url_sensor_->state;
   }
-  return "";
+  if (this->url_text_ != nullptr && this->url_text_->has_state()) {
+    return this->url_text_->state;
+  }
+  return this->url_;
 }
 
 static inline void websocket_force_reconnect(esp_websocket_client_handle_t client) {
@@ -136,6 +147,13 @@ void RemoteWebView::setup() {
     }
   }
 #endif
+
+  if (this->url_sensor_ != nullptr) {
+    this->url_sensor_->publish_state(this->url_);
+  }
+  if (this->url_text_ != nullptr) {
+    this->url_text_->publish_state(this->url_);
+  }
 }
 
 void RemoteWebView::loop() {
@@ -150,7 +168,7 @@ void RemoteWebView::loop() {
     this->trigger_on_frame_update();
   }
 
-  if (!this->url_sensor_) return;
+  if (!this->url_sensor_ && !this->url_text_) return;
   if (!this->url_publish_pending_.exchange(false, std::memory_order_acq_rel)) return;
 
   std::string url;
@@ -160,7 +178,9 @@ void RemoteWebView::loop() {
   }
 
   if (!url.empty()) {
-    this->url_sensor_->publish_state(url);
+    this->url_ = url;
+    if (this->url_sensor_) this->url_sensor_->publish_state(url);
+    if (this->url_text_) this->url_text_->publish_state(url);
     ESP_LOGD(TAG, "Current Server URL updated: %s", url.c_str());
   }
 }
@@ -206,11 +226,18 @@ void RemoteWebView::dump_config() {
 bool RemoteWebView::open_url(const std::string &s) {
   if (s.empty()) return false;
   
+  this->url_ = s;
+  if (this->url_sensor_ != nullptr) {
+    this->url_sensor_->publish_state(s);
+  }
+  if (this->url_text_ != nullptr) {
+    this->url_text_->publish_state(s);
+  }
+
   if (!ws_client_ || !esp_websocket_client_is_connected(ws_client_))
     return false;
   
   if (ws_send_open_url_(s.c_str(), 0)) {
-    url_ = s;
     ESP_LOGD(TAG, "opened URL: %s", s.c_str());
     return true;
   }
@@ -277,6 +304,8 @@ void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32
       if (self_) self_->last_keepalive_us_ = esp_timer_get_time();
       if (self_ && !self_->url_.empty()) {
         self_->ws_send_open_url_(self_->url_.c_str(), 0);
+        if (self_->url_sensor_) self_->url_sensor_->publish_state(self_->url_);
+        if (self_->url_text_) self_->url_text_->publish_state(self_->url_);
       }
       break;
 

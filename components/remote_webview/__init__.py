@@ -2,7 +2,7 @@ import re
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation
-from esphome.components import display, touchscreen, text_sensor
+from esphome.components import display, touchscreen, text_sensor, text
 from esphome.components.display import validate_rotation
 from esphome.const import CONF_ID, CONF_DISPLAY_ID, CONF_URL, CONF_ROTATION, CONF_TRIGGER_ID
 
@@ -24,12 +24,14 @@ CONF_SHOW_ACTIVITY_INDICATOR = "show_activity_indicator"
 
 CONF_ON_FRAME_UPDATE = "on_frame_update"
 CONF_CURRENT_URL_SENSOR = "current_url_sensor"
+CONF_CURRENT_URL_TEXT = "current_url_text"
+CONF_CURRENT_URL = "current_url"
 
 _SERVER_RE = re.compile(
     r"^(?P<host>[A-Za-z0-9](?:[A-Za-z0-9\-\.]*[A-Za-z0-9])?)\:(?P<port>\d{1,5})$"
 )
 
-AUTO_LOAD = ["text_sensor"]
+AUTO_LOAD = ["text_sensor", "text"]
 DEPENDENCIES = ["display"]
 
 def validate_host_port(value):
@@ -48,6 +50,7 @@ def validate_host_port(value):
 
 ns = cg.esphome_ns.namespace("remote_webview")
 RemoteWebView = ns.class_("RemoteWebView", cg.Component)
+RemoteWebViewUrlText = ns.class_("RemoteWebViewUrlText", text.Text, cg.Component)
 
 TriggerOnFrameUpdateAction = ns.class_(
     "TriggerOnFrameUpdateAction", automation.Action
@@ -84,6 +87,8 @@ CONFIG_SCHEMA = cv.Schema(
             }
         ),
         cv.Optional(CONF_CURRENT_URL_SENSOR): text_sensor.text_sensor_schema(),
+        cv.Optional(CONF_CURRENT_URL_TEXT): text.text_schema(RemoteWebViewUrlText, mode="TEXT"),
+        cv.Optional(CONF_CURRENT_URL): text.text_schema(RemoteWebViewUrlText, mode="TEXT"),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -152,3 +157,11 @@ async def to_code(config):
     if CONF_CURRENT_URL_SENSOR in config:
         sens = await text_sensor.new_text_sensor(config[CONF_CURRENT_URL_SENSOR])
         cg.add(var.set_url_sensor(sens))
+
+    for key in (CONF_CURRENT_URL_TEXT, CONF_CURRENT_URL):
+        if key in config:
+            conf = config[key]
+            txt = await text.new_text(conf, min_length=0, max_length=1024)
+            cg.add(txt.set_parent(var))
+            cg.add(var.set_url_text(txt))
+            await cg.register_component(txt, conf)
